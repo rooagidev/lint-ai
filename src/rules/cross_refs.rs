@@ -1,4 +1,5 @@
 use crate::config::{normalize_list, Config};
+use crate::filters::is_noise_concept;
 use crate::graph::{normalize_concept, Graph};
 use crate::report::Report;
 use aho_corasick::AhoCorasick;
@@ -6,6 +7,7 @@ use deunicode::deunicode;
 use inflector::Inflector;
 use std::collections::{HashMap, HashSet};
 use unicode_normalization::UnicodeNormalization;
+use petgraph::algo::kosaraju_scc;
 
 fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
@@ -51,34 +53,19 @@ fn surface_forms(raw: &str) -> Vec<String> {
     forms.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
-fn is_stopword(concept: &str) -> bool {
-    const STOP: &[&str] = &[
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "if", "in", "is",
-        "it", "its", "of", "on", "or", "the", "to", "via", "with",
-        "api", "app", "apps", "auth", "build", "config", "data", "doc", "docs", "feature",
-        "features", "file", "files", "guide", "help", "id", "index", "info", "issue", "issues",
-        "key", "keys", "log", "logs", "model", "models", "page", "pages", "role", "roles",
-        "run", "runs", "service", "services", "setup", "status", "system", "test", "tests",
-        "tool", "tools", "user", "users", "web", "cli", "sdk", "repo", "project",
-    ];
-    STOP.contains(&concept)
-}
-
-fn is_noise_concept(concept: &str, cfg: &Config) -> bool {
-    if concept.len() < 3 {
-        return true;
-    }
-    if concept.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    if is_stopword(concept) {
-        return true;
-    }
-    let extra = normalize_list(&cfg.stopwords);
-    extra.contains(&concept.to_string())
-}
 
 pub fn check_cross_refs(graph: &Graph, report: &mut Report, cfg: &Config) {
+    let sccs = kosaraju_scc(&graph.graph);
+    let mut component: HashMap<petgraph::graph::NodeIndex, usize> = HashMap::new();
+    for (idx, nodes) in sccs.iter().enumerate() {
+        for node in nodes {
+            component.insert(*node, idx);
+        }
+    }
+    let mut avg_rank = 0.0;
+    if graph.graph.node_count() > 0 {
+        avg_rank = graph.graph.edge_count() as f64 / graph.graph.node_count() as f64;
+    }
     let allowlist = normalize_list(&cfg.allowlist_concepts);
     let ignore_sections = normalize_list(&cfg.ignore_crossref_sections);
     let scope_prefix = cfg.scope_prefix.as_ref().map(|s| s.to_lowercase());
@@ -234,9 +221,21 @@ pub fn check_cross_refs(graph: &Graph, report: &mut Report, cfg: &Config) {
                 continue;
             }
             if !linked.contains(&concept) {
+                let mut severity = "low";
+                if let Some(idx) = graph.index.get(&concept) {
+                    let degree = graph.graph.edges(*idx).count() as f64;
+                    if degree >= avg_rank {
+                        severity = "high";
+                    }
+                    if let Some(src_idx) = graph.index.get(&page.concept) {
+                        if component.get(src_idx) != component.get(idx) {
+                            severity = "high";
+                        }
+                    }
+                }
                 report.add(format!(
-                    "Missing cross-ref in {} -> [[{}]]",
-                    page.rel_path, concept
+                    "Missing cross-ref in {} -> [[{}]] ({})",
+                    page.rel_path, concept, severity
                 ));
             }
         }
