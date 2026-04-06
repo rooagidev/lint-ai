@@ -1,9 +1,14 @@
 [package]
 name = "lint-ai"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Semantic wiki and docs linting for contradictions, stale claims, orphan pages, and missing cross-references"
 license = "Apache-2.0"
+repository = "https://github.com/RooAGI/Lint-AI"
+homepage = "https://www.rooagi.com"
+readme = "README.md"
+keywords = ["lint", "documentation", "markdown", "knowledge-base", "graph", "ai", "llm", "agents"]
+categories = ["text-processing", "command-line-utilities"]
 
 [lib]
 name = "lint_ai"
