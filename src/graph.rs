@@ -1,8 +1,9 @@
 use anyhow::Result;
 use comrak::{nodes::NodeValue, parse_document, Arena, ComrakOptions};
 use deunicode::deunicode;
+use petgraph::graph::{DiGraph, NodeIndex};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
@@ -21,6 +22,8 @@ pub struct Page {
 
 pub struct Graph {
     pub pages: Vec<Page>,
+    pub index: HashMap<String, NodeIndex>,
+    pub graph: DiGraph<String, ()>,
 }
 
 pub fn normalize_concept(s: &str) -> String {
@@ -207,7 +210,22 @@ impl Graph {
             pages.push(page);
         }
 
-        Ok(Self { pages })
+        let mut graph = DiGraph::<String, ()>::new();
+        let mut index: HashMap<String, NodeIndex> = HashMap::new();
+        for page in &pages {
+            let node = graph.add_node(page.rel_path.clone());
+            index.insert(page.concept.clone(), node);
+        }
+        for page in &pages {
+            if let Some(&from) = index.get(&page.concept) {
+                for link in &page.links {
+                    if let Some(&to) = index.get(link) {
+                        graph.add_edge(from, to, ());
+                    }
+                }
+            }
+        }
+        Ok(Self { pages, index, graph })
     }
 }
 

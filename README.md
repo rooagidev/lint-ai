@@ -11,6 +11,14 @@ islands, and keep a large doc set coherent.
 
 ## Usage
 
+### How To Use
+
+Run the linter against a docs directory:
+
+```bash
+./lint-ai /path/to/repo
+```
+
 ### Download Release Binaries
 
 Download the latest release binary from the GitHub Releases page for this repo, then verify the checksum.
@@ -35,11 +43,7 @@ sha256sum lint-ai-linux-x86_64
 shasum -a 256 lint-ai-macos-x86_64
 ```
 
-Run the linter against a docs directory:
-
-```bash
-./lint-ai /path/to/repo
-```
+## Advanced
 
 By default the linter skips files larger than 5MB and stops after 50k files. Override these limits:
 
@@ -240,4 +244,21 @@ group_messages
 groupmessages
 group message
 group messages
+```
+
+## Output Examples
+
+Sample findings now include severity tags and link‑debt signals:
+
+```
+Missing cross-ref in docs/channels/discord.md -> [[signal]] (high)
+Low link density in docs/channels/location.md (outgoing 1, avg 4.2)
+Unreachable page: docs/channels/legacy.md
+Orphan page: docs/channels/unused.md
+```
+
+Orphan detection example command:
+
+```bash
+./lint-ai /path/to/openclaw/docs/channels
 ```
