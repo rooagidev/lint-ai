@@ -7,12 +7,14 @@ use walkdir::WalkDir;
 pub struct Graph {
     pub pages: HashSet<String>,
     pub links: HashMap<String, HashSet<String>>,
+    pub contents: HashMap<String, String>,
 }
 
 impl Graph {
     pub fn build(path: &str) -> Result<Self> {
         let mut pages = HashSet::new();
         let mut links: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut contents = HashMap::new();
 
         let link_re = Regex::new(r"\[\[(.*?)\]\]")?;
 
@@ -31,6 +33,8 @@ impl Graph {
             pages.insert(path_str.clone());
 
             let content = fs::read_to_string(entry.path())?;
+            contents.insert(path_str.clone(), content.clone());
+
             let mut page_links = HashSet::new();
 
             for cap in link_re.captures_iter(&content) {
@@ -40,6 +44,6 @@ impl Graph {
             links.insert(path_str, page_links);
         }
 
-        Ok(Self { pages, links })
+        Ok(Self { pages, links, contents })
     }
 }
