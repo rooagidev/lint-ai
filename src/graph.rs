@@ -1,27 +1,113 @@
 use anyhow::Result;
+use comrak::{nodes::NodeValue, parse_document, Arena, ComrakOptions};
+use deunicode::deunicode;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
+use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub path: String,
+    pub rel_path: String,
+    pub concept: String,
+    pub raw_concept: String,
+    pub content: String,
+    pub links: HashSet<String>,
+    pub headings: Vec<String>,
+}
+
 pub struct Graph {
-    pub pages: HashSet<String>,
-    pub links: HashMap<String, HashSet<String>>,
-    pub contents: HashMap<String, String>,
+    pub pages: Vec<Page>,
+}
+
+pub fn normalize_concept(s: &str) -> String {
+    let normalized: String = s
+        .nfc()
+        .collect::<String>()
+        .trim()
+        .to_lowercase()
+        .replace('_', " ")
+        .replace('-', " ");
+    deunicode(&normalized).to_lowercase()
+}
+
+fn strip_anchor(target: &str) -> &str {
+    target.split('#').next().unwrap_or(target)
+}
+
+fn concept_from_link_target(target: &str) -> Option<String> {
+    let target = strip_anchor(target).trim();
+    if target.is_empty() || target.starts_with("http://") || target.starts_with("https://") {
+        return None;
+    }
+    if target.starts_with("mailto:") || target.starts_with("tel:") {
+        return None;
+    }
+    if target.starts_with('#') {
+        return None;
+    }
+
+    let target = target.trim_end_matches('/');
+    let path = Path::new(target);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(target);
+    if stem.is_empty() {
+        return None;
+    }
+    Some(normalize_concept(stem))
+}
+
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn docs_dir(root: &Path) -> PathBuf {
+    if root.is_file() {
+        return root.parent().unwrap_or(root).to_path_buf();
+    }
+    let docs = root.join("docs");
+    if docs.is_dir() {
+        docs
+    } else {
+        root.to_path_buf()
+    }
 }
 
 impl Graph {
     pub fn build(path: &str) -> Result<Self> {
-        let mut pages = HashSet::new();
-        let mut links: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut contents = HashMap::new();
+        let root = Path::new(path);
+        let base = docs_dir(root);
+        let base_walk = base.clone();
+        let single_file = if root.is_file() {
+            Some(root.to_path_buf())
+        } else {
+            None
+        };
+        let rel_root = if root.is_file() { base.as_path() } else { root };
 
-        let link_re = Regex::new(r"\[\[(.*?)\]\]")?;
+        let wiki_link_re = Regex::new(r"\[\[(.*?)\]\]")?;
+        let md_link_re = Regex::new(r"\[([^\]]+)\]\(([^)]+)\)")?;
+        let md_heading_re = Regex::new(r"(?m)^#{1,6}\s+(.*)$")?;
 
-        for entry in WalkDir::new(path) {
+        let mut pages = Vec::new();
+
+        for entry in WalkDir::new(base_walk) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
+            }
+            if let Some(ref only) = single_file {
+                if entry.path() != only {
+                    continue;
+                }
             }
 
             let ext = entry.path().extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -29,21 +115,77 @@ impl Graph {
                 continue;
             }
 
-            let path_str = entry.path().display().to_string();
-            pages.insert(path_str.clone());
-
             let content = fs::read_to_string(entry.path())?;
-            contents.insert(path_str.clone(), content.clone());
+            let raw_concept = entry
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let concept = normalize_concept(&raw_concept);
 
-            let mut page_links = HashSet::new();
+            let mut links = HashSet::new();
+            let mut headings = Vec::new();
 
-            for cap in link_re.captures_iter(&content) {
-                page_links.insert(cap[1].trim().to_string());
+            for cap in wiki_link_re.captures_iter(&content) {
+                let target = cap[1].trim();
+                if let Some(concept) = concept_from_link_target(target) {
+                    links.insert(concept);
+                }
             }
 
-            links.insert(path_str, page_links);
+            for cap in md_link_re.captures_iter(&content) {
+                let target = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                if let Some(concept) = concept_from_link_target(target) {
+                    links.insert(concept);
+                }
+            }
+
+            for cap in md_heading_re.captures_iter(&content) {
+                let heading = cap[1].trim();
+                if !heading.is_empty() {
+                    headings.push(heading.to_string());
+                }
+            }
+
+            if headings.is_empty() {
+                let arena = Arena::new();
+                let ast = parse_document(&arena, &content, &ComrakOptions::default());
+                let mut stack = vec![ast];
+                while let Some(node) = stack.pop() {
+                    for child in node.children() {
+                        stack.push(child);
+                    }
+                    if let NodeValue::Heading(ref heading) = node.data.borrow().value {
+                        let mut text = String::new();
+                        for child in node.children() {
+                            if let NodeValue::Text(ref t) = child.data.borrow().value {
+                                text.push_str(t);
+                            }
+                        }
+                        if !text.is_empty() {
+                            headings.push(text);
+                        } else if heading.level > 0 {
+                            // Fallback to keep a placeholder for structure.
+                            headings.push(format!("(heading level {})", heading.level));
+                        }
+                    }
+                }
+            }
+
+            let page = Page {
+                path: entry.path().display().to_string(),
+                rel_path: rel_path(rel_root, entry.path()),
+                concept,
+                raw_concept,
+                content,
+                links,
+                headings,
+            };
+
+            pages.push(page);
         }
 
-        Ok(Self { pages, links, contents })
+        Ok(Self { pages })
     }
 }
