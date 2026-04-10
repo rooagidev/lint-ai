@@ -35,7 +35,7 @@ pub struct Tier1DocEntities {
     pub key_entities: Vec<Tier1Entity>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RankedTerm {
     pub term: String,
     pub score: f32,

@@ -1,0 +1,38 @@
+[
+  {
+    "term": "install",
+    "related": [
+      {"term": "setup", "relation": "Synonym", "confidence": 0.98},
+      {"term": "configure", "relation": "SimilarTo", "confidence": 0.86},
+      {"term": "deploy", "relation": "SimilarTo", "confidence": 0.84}
+    ]
+  },
+  {
+    "term": "docker",
+    "related": [
+      {"term": "container", "relation": "SimilarTo", "confidence": 0.87},
+      {"term": "container runtime", "relation": "SimilarTo", "confidence": 0.83}
+    ]
+  },
+  {
+    "term": "linux",
+    "related": [
+      {"term": "gnu linux", "relation": "Synonym", "confidence": 0.95},
+      {"term": "unix-like", "relation": "SimilarTo", "confidence": 0.81}
+    ]
+  },
+  {
+    "term": "auth",
+    "related": [
+      {"term": "authentication", "relation": "Synonym", "confidence": 0.97},
+      {"term": "authorization", "relation": "RelatedTo", "confidence": 0.72}
+    ]
+  },
+  {
+    "term": "vm",
+    "related": [
+      {"term": "virtual machine", "relation": "Synonym", "confidence": 0.97},
+      {"term": "instance", "relation": "SimilarTo", "confidence": 0.79}
+    ]
+  }
+]

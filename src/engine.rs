@@ -1,8 +1,8 @@
-use crate::cli::{Tier1NerProvider, Tier1TermRankerKind};
+use crate::cli::{ChunkStrategy, Tier1NerProvider, Tier1TermRankerKind};
 use crate::config::{load_config, normalize_list, Config};
 use crate::filters::is_noise_concept;
 use crate::graph::{normalize_concept, Graph, Tier0Record};
-use crate::index::{DocRecord, MemoryIndex, Provenance};
+use crate::index::{DocRecord, MemoryIndex, Provenance, SectionChunk};
 use crate::report::Report;
 use crate::rules::cross_refs::check_cross_refs;
 use crate::rules::orphan_pages::check_orphans;
@@ -19,12 +19,15 @@ use comrak::{
 };
 use deunicode::deunicode;
 use inflector::Inflector;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
+use regex::Regex;
+use walkdir::WalkDir;
 
 fn surface_forms(raw: &str) -> Vec<String> {
     let raw = raw.trim();
@@ -567,11 +570,256 @@ fn select_term_ranker(ranker_kind: &Tier1TermRankerKind) -> Box<dyn ImportantTer
     }
 }
 
+fn chunk_document_sections(content: &str, doc_id: &str) -> Vec<SectionChunk> {
+    let heading_re = Regex::new(r"(?m)^#{1,6}\s+(.*)$").expect("valid heading regex");
+    let mut chunks = Vec::new();
+    let mut last_start = 0usize;
+    let mut current_heading = "(document)".to_string();
+    let mut idx = 0usize;
+
+    for cap in heading_re.captures_iter(content) {
+        let m = match cap.get(0) {
+            Some(v) => v,
+            None => continue,
+        };
+        if m.start() > last_start {
+            let body = content[last_start..m.start()].trim();
+            if !body.is_empty() {
+                let start_line = content[..last_start].lines().count().max(1);
+                let end_line = content[..m.start()].lines().count().max(start_line);
+                chunks.push(SectionChunk {
+                    chunk_id: format!("{}::{}", doc_id, idx),
+                    heading: current_heading.clone(),
+                    content: body.to_string(),
+                    start_line,
+                    end_line,
+                    key_entities: Vec::new(),
+                    important_terms: Vec::new(),
+                });
+                idx += 1;
+            }
+        }
+        current_heading = cap
+            .get(1)
+            .map(|v| v.as_str().trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "(section)".to_string());
+        last_start = m.end();
+    }
+
+    let tail = content[last_start..].trim();
+    if !tail.is_empty() {
+        let start_line = content[..last_start].lines().count().max(1);
+        let end_line = content.lines().count().max(start_line);
+        chunks.push(SectionChunk {
+            chunk_id: format!("{}::{}", doc_id, idx),
+            heading: current_heading,
+            content: tail.to_string(),
+            start_line,
+            end_line,
+            key_entities: Vec::new(),
+            important_terms: Vec::new(),
+        });
+    }
+
+    if chunks.is_empty() {
+        chunks.push(SectionChunk {
+            chunk_id: format!("{}::0", doc_id),
+            heading: "(document)".to_string(),
+            content: content.to_string(),
+            start_line: 1,
+            end_line: content.lines().count().max(1),
+            key_entities: Vec::new(),
+            important_terms: Vec::new(),
+        });
+    }
+    chunks
+}
+
+fn chunk_document_lines(
+    content: &str,
+    doc_id: &str,
+    lines_per_chunk: usize,
+    overlap: usize,
+) -> Vec<SectionChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return vec![SectionChunk {
+            chunk_id: format!("{}::0", doc_id),
+            heading: "(document)".to_string(),
+            content: content.to_string(),
+            start_line: 1,
+            end_line: 1,
+            key_entities: Vec::new(),
+            important_terms: Vec::new(),
+        }];
+    }
+    let size = lines_per_chunk.clamp(1, 500);
+    let ov = overlap.min(size.saturating_sub(1));
+    let step = (size - ov).max(1);
+
+    let mut chunks = Vec::new();
+    let mut idx = 0usize;
+    let mut start = 0usize;
+    while start < lines.len() {
+        let end = (start + size).min(lines.len());
+        let body = lines[start..end].join("\n").trim().to_string();
+        if !body.is_empty() {
+            chunks.push(SectionChunk {
+                chunk_id: format!("{}::{}", doc_id, idx),
+                heading: format!("lines {}-{}", start + 1, end),
+                content: body,
+                start_line: start + 1,
+                end_line: end,
+                key_entities: Vec::new(),
+                important_terms: Vec::new(),
+            });
+            idx += 1;
+        }
+        if end == lines.len() {
+            break;
+        }
+        start += step;
+    }
+    if chunks.is_empty() {
+        chunks.push(SectionChunk {
+            chunk_id: format!("{}::0", doc_id),
+            heading: "(document)".to_string(),
+            content: content.to_string(),
+            start_line: 1,
+            end_line: lines.len().max(1),
+            key_entities: Vec::new(),
+            important_terms: Vec::new(),
+        });
+    }
+    chunks
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    let words = text.split_whitespace().count();
+    ((words as f32) * 1.3).ceil() as usize
+}
+
+fn chunk_document_hybrid(
+    content: &str,
+    doc_id: &str,
+    lines_per_chunk: usize,
+    overlap: usize,
+    target_tokens: usize,
+    max_tokens: usize,
+) -> Vec<SectionChunk> {
+    let base = chunk_document_lines(content, doc_id, lines_per_chunk, overlap);
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    let safe_target = target_tokens.clamp(100, max_tokens.max(100));
+    let safe_max = max_tokens.max(safe_target);
+
+    for chunk in base {
+        if estimate_tokens(&chunk.content) <= safe_max {
+            out.push(SectionChunk {
+                chunk_id: format!("{}::{}", doc_id, idx),
+                heading: chunk.heading,
+                content: chunk.content,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                key_entities: Vec::new(),
+                important_terms: Vec::new(),
+            });
+            idx += 1;
+            continue;
+        }
+
+        let lines: Vec<&str> = chunk.content.lines().collect();
+        let mut start = 0usize;
+        while start < lines.len() {
+            let mut end = start + 1;
+            let mut best_end = end;
+            while end <= lines.len() {
+                let candidate = lines[start..end].join("\n");
+                let toks = estimate_tokens(&candidate);
+                if toks <= safe_target {
+                    best_end = end;
+                    end += 1;
+                    continue;
+                }
+                if toks <= safe_max && best_end == start + 1 {
+                    best_end = end;
+                }
+                break;
+            }
+            if best_end <= start {
+                best_end = (start + 1).min(lines.len());
+            }
+            let body = lines[start..best_end].join("\n").trim().to_string();
+            if !body.is_empty() {
+                out.push(SectionChunk {
+                    chunk_id: format!("{}::{}", doc_id, idx),
+                    heading: format!("{} (part {})", chunk.heading, idx),
+                    content: body,
+                    start_line: chunk.start_line.saturating_add(start),
+                    end_line: chunk.start_line.saturating_add(best_end).saturating_sub(1),
+                    key_entities: Vec::new(),
+                    important_terms: Vec::new(),
+                });
+                idx += 1;
+            }
+            if best_end == lines.len() {
+                break;
+            }
+            start = best_end;
+        }
+    }
+
+    if out.is_empty() {
+        return chunk_document_lines(content, doc_id, lines_per_chunk, overlap);
+    }
+    out
+}
+
+fn enrich_section_chunks(
+    mut chunks: Vec<SectionChunk>,
+    key_entities: &[crate::tier1::Tier1Entity],
+    important_terms: &[crate::tier1::RankedTerm],
+) -> Vec<SectionChunk> {
+    for chunk in &mut chunks {
+        let chunk_l = chunk.content.to_lowercase();
+        for ent in key_entities {
+            let term = ent.text.trim();
+            if term.len() < 2 {
+                continue;
+            }
+            if chunk_l.contains(&term.to_lowercase()) {
+                chunk.key_entities.push(term.to_string());
+            }
+        }
+        for term in important_terms {
+            let t = term.term.trim();
+            if t.len() < 2 {
+                continue;
+            }
+            if chunk_l.contains(&t.to_lowercase()) {
+                chunk.important_terms.push(t.to_string());
+            }
+        }
+        chunk.key_entities.sort();
+        chunk.key_entities.dedup();
+        chunk.important_terms.sort();
+        chunk.important_terms.dedup();
+    }
+    chunks
+}
+
 fn build_memory_index(
     graph: &Graph,
     provider: &Tier1NerProvider,
     spacy_model: &str,
     ranker_kind: &Tier1TermRankerKind,
+    chunk_strategy: &ChunkStrategy,
+    chunk_lines: usize,
+    chunk_overlap: usize,
+    chunk_target_tokens: usize,
+    chunk_max_tokens: usize,
+    lexical_dir: Option<&Path>,
 ) -> Result<MemoryIndex> {
     let docs: Vec<Tier1DocInput> = graph
         .pages
@@ -648,6 +896,21 @@ fn build_memory_index(
         } else {
             None
         };
+        let base_chunks = match chunk_strategy {
+            ChunkStrategy::Heading => chunk_document_sections(&doc.content, &doc.id),
+            ChunkStrategy::Line => {
+                chunk_document_lines(&doc.content, &doc.id, chunk_lines, chunk_overlap)
+            }
+            ChunkStrategy::Hybrid => chunk_document_hybrid(
+                &doc.content,
+                &doc.id,
+                chunk_lines,
+                chunk_overlap,
+                chunk_target_tokens,
+                chunk_max_tokens,
+            ),
+        };
+        let section_chunks = enrich_section_chunks(base_chunks, &key_entities, &important_terms);
         records.push(DocRecord {
             doc_id: doc.id.clone(),
             source: doc.source.clone(),
@@ -660,6 +923,7 @@ fn build_memory_index(
             headings: doc.headings.clone(),
             key_entities,
             important_terms,
+            section_chunks,
             embedding: None,
             top_claims: Vec::new(),
             provenance: Provenance {
@@ -671,7 +935,228 @@ fn build_memory_index(
             },
         });
     }
-    Ok(MemoryIndex::from_records(records))
+    Ok(MemoryIndex::from_records_with_lexical_dir(records, lexical_dir))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedQueryIndex {
+    version: String,
+    path: String,
+    ner_provider: String,
+    term_ranker: String,
+    spacy_model: String,
+    chunk_strategy: String,
+    chunk_lines: usize,
+    chunk_overlap: usize,
+    chunk_target_tokens: usize,
+    chunk_max_tokens: usize,
+    corpus_fingerprint: String,
+    records: Vec<DocRecord>,
+}
+
+const QUERY_CACHE_VERSION: &str = "v1-query-cache";
+
+#[derive(Debug, Clone)]
+struct CacheSettings<'a> {
+    root_path: &'a str,
+    ner_provider: &'a Tier1NerProvider,
+    term_ranker: &'a Tier1TermRankerKind,
+    spacy_model: &'a str,
+    chunk_strategy: &'a ChunkStrategy,
+    chunk_lines: usize,
+    chunk_overlap: usize,
+    chunk_target_tokens: usize,
+    chunk_max_tokens: usize,
+}
+
+fn query_cache_key(s: &CacheSettings<'_>) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.root_path.hash(&mut hasher);
+    format!("{:?}", s.ner_provider).to_lowercase().hash(&mut hasher);
+    format!("{:?}", s.term_ranker).to_lowercase().hash(&mut hasher);
+    s.spacy_model.hash(&mut hasher);
+    format!("{:?}", s.chunk_strategy).to_lowercase().hash(&mut hasher);
+    s.chunk_lines.hash(&mut hasher);
+    s.chunk_overlap.hash(&mut hasher);
+    s.chunk_target_tokens.hash(&mut hasher);
+    s.chunk_max_tokens.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn query_cache_file(s: &CacheSettings<'_>) -> PathBuf {
+    Path::new(".lint-ai-cache").join(format!("{}.json", query_cache_key(s)))
+}
+
+fn query_cache_lexical_dir(s: &CacheSettings<'_>) -> PathBuf {
+    Path::new(".lint-ai-cache").join(format!("{}.tantivy", query_cache_key(s)))
+}
+
+fn query_cache_core_file(s: &CacheSettings<'_>) -> PathBuf {
+    Path::new(".lint-ai-cache").join(format!("{}.core.bin", query_cache_key(s)))
+}
+
+fn fingerprint_base_path(root_path: &str) -> PathBuf {
+    let root = Path::new(root_path);
+    if root.is_file() {
+        return root.parent().unwrap_or(root).to_path_buf();
+    }
+    let docs = root.join("docs");
+    if docs.is_dir() {
+        docs
+    } else {
+        root.to_path_buf()
+    }
+}
+
+fn compute_corpus_fingerprint(
+    root_path: &str,
+    max_files: usize,
+    max_depth: usize,
+    max_total_bytes: usize,
+) -> String {
+    let root = Path::new(root_path);
+    let base = fingerprint_base_path(root_path);
+    let single_file = if root.is_file() {
+        Some(root.to_path_buf())
+    } else {
+        None
+    };
+    let rel_root = if root.is_file() {
+        base.clone()
+    } else {
+        root.to_path_buf()
+    };
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root_path.hash(&mut hasher);
+    let mut files_seen = 0usize;
+    let mut total_bytes = 0usize;
+    let mut items: Vec<(String, u64, u64, u64)> = Vec::new();
+
+    for entry in WalkDir::new(base).max_depth(max_depth) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Some(ref only) = single_file {
+            if entry.path() != only {
+                continue;
+            }
+        }
+        let ext = entry
+            .path()
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if ext != "md" {
+            continue;
+        }
+        files_seen += 1;
+        if files_seen > max_files {
+            break;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        total_bytes = total_bytes.saturating_add(metadata.len() as usize);
+        if total_bytes > max_total_bytes {
+            break;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&rel_root)
+            .unwrap_or(entry.path())
+            .display()
+            .to_string();
+        let mut mtime_secs = 0u64;
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                mtime_secs = dur.as_secs();
+            }
+        }
+        let content_hash = match fs::read(entry.path()) {
+            Ok(bytes) => {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                h.finish()
+            }
+            Err(_) => 0,
+        };
+        items.push((rel, metadata.len(), mtime_secs, content_hash));
+    }
+
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, len, mtime_secs, content_hash) in items {
+        rel.hash(&mut hasher);
+        len.hash(&mut hasher);
+        mtime_secs.hash(&mut hasher);
+        content_hash.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn load_cached_query_index(s: &CacheSettings<'_>, corpus_fingerprint: &str) -> Option<MemoryIndex> {
+    let cache_file = query_cache_file(s);
+    let data = fs::read_to_string(&cache_file).ok()?;
+    let cached: CachedQueryIndex = serde_json::from_str(&data).ok()?;
+    if cached.version != QUERY_CACHE_VERSION
+        || cached.path != s.root_path
+        || cached.ner_provider != format!("{:?}", s.ner_provider).to_lowercase()
+        || cached.term_ranker != format!("{:?}", s.term_ranker).to_lowercase()
+        || cached.spacy_model != s.spacy_model
+        || cached.chunk_strategy != format!("{:?}", s.chunk_strategy).to_lowercase()
+        || cached.chunk_lines != s.chunk_lines
+        || cached.chunk_overlap != s.chunk_overlap
+        || cached.chunk_target_tokens != s.chunk_target_tokens
+        || cached.chunk_max_tokens != s.chunk_max_tokens
+        || cached.corpus_fingerprint != corpus_fingerprint
+    {
+        return None;
+    }
+    let lexical_dir = query_cache_lexical_dir(s);
+    let core_file = query_cache_core_file(s);
+    match MemoryIndex::load_with_binary_core(cached.records.clone(), &core_file, Some(&lexical_dir)) {
+        Ok(index) => return Some(index),
+        Err(err) => {
+            eprintln!("warning: binary core cache load failed (falling back): {}", err);
+        }
+    }
+    Some(MemoryIndex::from_records_with_lexical_dir(
+        cached.records,
+        Some(&lexical_dir),
+    ))
+}
+
+fn save_cached_query_index(
+    s: &CacheSettings<'_>,
+    corpus_fingerprint: &str,
+    index: &MemoryIndex,
+) -> Result<()> {
+    let cache_file = query_cache_file(s);
+    if let Some(parent) = cache_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let records = index.docs.values().cloned().collect::<Vec<_>>();
+    let payload = CachedQueryIndex {
+        version: QUERY_CACHE_VERSION.to_string(),
+        path: s.root_path.to_string(),
+        ner_provider: format!("{:?}", s.ner_provider).to_lowercase(),
+        term_ranker: format!("{:?}", s.term_ranker).to_lowercase(),
+        spacy_model: s.spacy_model.to_string(),
+        chunk_strategy: format!("{:?}", s.chunk_strategy).to_lowercase(),
+        chunk_lines: s.chunk_lines,
+        chunk_overlap: s.chunk_overlap,
+        chunk_target_tokens: s.chunk_target_tokens,
+        chunk_max_tokens: s.chunk_max_tokens,
+        corpus_fingerprint: corpus_fingerprint.to_string(),
+        records,
+    };
+    fs::write(cache_file, serde_json::to_string(&payload)?)?;
+    let core_file = query_cache_core_file(s);
+    index.save_binary_core(&core_file)?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -681,6 +1166,14 @@ struct Tier0IndexFile {
     path: String,
     document_count: usize,
     documents_by_id: BTreeMap<String, Tier0Record>,
+}
+
+#[derive(Serialize)]
+struct QueryOutput {
+    query: String,
+    elapsed_ms: u128,
+    result_count: usize,
+    results: Vec<crate::index::SearchResult>,
 }
 
 fn write_tier0_index(path: &str, records: &[Tier0Record], scanned_path: &str) -> Result<String> {
@@ -724,6 +1217,76 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         args.max_config_bytes,
     )
     .map_err(|err| anyhow::anyhow!(err))?;
+    if args.query.is_some() {
+        let cache_settings = CacheSettings {
+            root_path: &args.path,
+            ner_provider: &args.tier1_ner_provider,
+            term_ranker: &args.tier1_term_ranker,
+            spacy_model: &args.spacy_model,
+            chunk_strategy: &args.chunk_strategy,
+            chunk_lines: args.chunk_lines,
+            chunk_overlap: args.chunk_overlap,
+            chunk_target_tokens: args.chunk_target_tokens,
+            chunk_max_tokens: args.chunk_max_tokens,
+        };
+        let corpus_fingerprint = compute_corpus_fingerprint(
+            &args.path,
+            args.max_files,
+            args.max_depth,
+            args.max_total_bytes,
+        );
+        let lexical_dir = query_cache_lexical_dir(&cache_settings);
+        let index = if let Some(cached) = load_cached_query_index(&cache_settings, &corpus_fingerprint) {
+            cached
+        } else {
+            let mut graph = Graph::build(
+                &args.path,
+                args.max_bytes,
+                args.max_files,
+                args.max_depth,
+                args.max_total_bytes,
+            )?;
+            if !cfg.ignore_paths.is_empty() {
+                let ignore = normalize_list(&cfg.ignore_paths);
+                graph.pages.retain(|p| {
+                    let rel = p.rel_path.to_lowercase();
+                    !ignore.iter().any(|pat| rel.contains(pat))
+                });
+                let retained: HashSet<String> =
+                    graph.pages.iter().map(|p| p.rel_path.clone()).collect();
+                graph.tier0_records.retain(|r| retained.contains(&r.source));
+            }
+            let built = build_memory_index(
+                &graph,
+                &args.tier1_ner_provider,
+                &args.spacy_model,
+                &args.tier1_term_ranker,
+                &args.chunk_strategy,
+                args.chunk_lines,
+                args.chunk_overlap,
+                args.chunk_target_tokens,
+                args.chunk_max_tokens,
+                Some(&lexical_dir),
+            )?;
+            if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built) {
+                eprintln!("warning: unable to persist query cache: {}", err);
+            }
+            built
+        };
+        if let Some(query) = args.query.as_deref() {
+            let started = Instant::now();
+            let results = index.query(query, 20);
+            let payload = QueryOutput {
+                query: query.to_string(),
+                elapsed_ms: started.elapsed().as_millis(),
+                result_count: results.len(),
+                results,
+            };
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        return Ok(());
+    }
+
     let mut graph = Graph::build(
         &args.path,
         args.max_bytes,
@@ -752,17 +1315,41 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         show_tier1_terms(&graph, &args.tier1_term_ranker)?;
         return Ok(());
     }
-    if args.index || args.index_redacted || args.query.is_some() {
+    if args.index || args.index_redacted {
+        let cache_settings = CacheSettings {
+            root_path: &args.path,
+            ner_provider: &args.tier1_ner_provider,
+            term_ranker: &args.tier1_term_ranker,
+            spacy_model: &args.spacy_model,
+            chunk_strategy: &args.chunk_strategy,
+            chunk_lines: args.chunk_lines,
+            chunk_overlap: args.chunk_overlap,
+            chunk_target_tokens: args.chunk_target_tokens,
+            chunk_max_tokens: args.chunk_max_tokens,
+        };
+        let corpus_fingerprint = compute_corpus_fingerprint(
+            &args.path,
+            args.max_files,
+            args.max_depth,
+            args.max_total_bytes,
+        );
+        let lexical_dir = query_cache_lexical_dir(&cache_settings);
         let index = build_memory_index(
             &graph,
             &args.tier1_ner_provider,
             &args.spacy_model,
             &args.tier1_term_ranker,
+            &args.chunk_strategy,
+            args.chunk_lines,
+            args.chunk_overlap,
+            args.chunk_target_tokens,
+            args.chunk_max_tokens,
+            Some(&lexical_dir),
         )?;
-        if let Some(query) = args.query.as_deref() {
-            let results = index.query(query, 20);
-            println!("{}", serde_json::to_string_pretty(&results)?);
-        } else if args.index_redacted {
+        if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &index) {
+            eprintln!("warning: unable to persist query cache: {}", err);
+        }
+        if args.index_redacted {
             println!("{}", serde_json::to_string_pretty(&index.redacted_for_export())?);
         } else {
             println!("{}", serde_json::to_string_pretty(&index)?);

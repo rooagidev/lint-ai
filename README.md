@@ -75,17 +75,6 @@ Lint-AI builds on techniques such as:
 
 These are used as part of a larger system for fact extraction and alignment reasoning.
 
-## What Lint-AI is NOT
-
-Lint-AI is not:
-- a Markdown style checker
-- a grammar tool
-- a fixed template enforcer
-
-It does not require documents to follow a rigid schema.
-
-Instead, it focuses on understanding what documents *mean* and how they relate to each other.
-
 ## Usage
 
 ### How To Use
@@ -148,6 +137,18 @@ Query the corpus (index is built automatically behind the scenes):
 ./lint-ai --query "docker install linux" /path/to/repo/docs
 ```
 
+Query output includes:
+- `query`
+- `elapsed_ms`
+- `result_count`
+- `results`
+
+Chunking options:
+
+```bash
+./lint-ai --index /path/to/repo/docs --chunk-strategy hybrid --chunk-lines 40 --chunk-overlap 10 --chunk-target-tokens 450 --chunk-max-tokens 800
+```
+
 The query pipeline uses hybrid scoring with:
 - BM25 lexical scoring
 - key-entity overlap
@@ -155,11 +156,13 @@ The query pipeline uses hybrid scoring with:
 - topic/doc-type boosts when available
 - score breakdown output for transparency
 
+Chunk strategy details: `docs/chunk-strategy.md`
+
 ### Download Release Binaries
 
 Download the latest release binary from the GitHub Releases page for this repo, then verify the checksum.
 
-Release artifacts (v0.1.2):
+Release artifacts (v0.1.3):
 
 ```
 lint-ai-linux-x86_64
