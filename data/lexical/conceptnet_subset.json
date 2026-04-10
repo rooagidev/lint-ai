@@ -1,0 +1,38 @@
+[
+  {
+    "term": "install",
+    "related": [
+      {"term": "bootstrap", "relation": "RelatedTo", "confidence": 0.91},
+      {"term": "provision", "relation": "SimilarTo", "confidence": 0.88},
+      {"term": "set up", "relation": "Synonym", "confidence": 0.96}
+    ]
+  },
+  {
+    "term": "docker",
+    "related": [
+      {"term": "containerization", "relation": "RelatedTo", "confidence": 0.89},
+      {"term": "podman", "relation": "SimilarTo", "confidence": 0.83}
+    ]
+  },
+  {
+    "term": "query",
+    "related": [
+      {"term": "search", "relation": "Synonym", "confidence": 0.95},
+      {"term": "lookup", "relation": "SimilarTo", "confidence": 0.84}
+    ]
+  },
+  {
+    "term": "drift",
+    "related": [
+      {"term": "divergence", "relation": "SimilarTo", "confidence": 0.86},
+      {"term": "misalignment", "relation": "RelatedTo", "confidence": 0.9}
+    ]
+  },
+  {
+    "term": "virtual machine",
+    "related": [
+      {"term": "vm", "relation": "Synonym", "confidence": 0.97},
+      {"term": "compute instance", "relation": "SimilarTo", "confidence": 0.84}
+    ]
+  }
+]

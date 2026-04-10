@@ -14,6 +14,13 @@ pub enum Tier1TermRankerKind {
     Textrank,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+pub enum ChunkStrategy {
+    Heading,
+    Line,
+    Hybrid,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "lint-ai")]
 /// CLI arguments for the lint-ai binary.
@@ -43,6 +50,16 @@ pub struct Args {
     pub tier1_term_ranker: Tier1TermRankerKind,
     #[arg(long, default_value = "en_core_web_sm")]
     pub spacy_model: String,
+    #[arg(long, value_enum, default_value = "heading")]
+    pub chunk_strategy: ChunkStrategy,
+    #[arg(long, default_value_t = 40)]
+    pub chunk_lines: usize,
+    #[arg(long, default_value_t = 10)]
+    pub chunk_overlap: usize,
+    #[arg(long, default_value_t = 450)]
+    pub chunk_target_tokens: usize,
+    #[arg(long, default_value_t = 800)]
+    pub chunk_max_tokens: usize,
     #[arg(long)]
     pub debug_matches: bool,
     #[arg(long)]

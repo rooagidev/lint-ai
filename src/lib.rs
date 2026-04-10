@@ -24,6 +24,7 @@ pub mod engine;
 pub mod filters;
 pub mod graph;
 pub mod index;
+pub mod query_expansion;
 pub mod report;
 pub mod rules;
 pub mod tier1;

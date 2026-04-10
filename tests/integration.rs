@@ -1,8 +1,10 @@
 use lint_ai::config::Config;
 use lint_ai::graph::Graph;
+use lint_ai::index::{DocRecord, MemoryIndex, Provenance};
 use lint_ai::report::Report;
 use lint_ai::rules::cross_refs::check_cross_refs;
 use lint_ai::rules::orphan_pages::check_orphans;
+use lint_ai::tier1::{RankedTerm, Tier1Entity};
 use std::fs;
 use std::path::PathBuf;
 
@@ -120,4 +122,82 @@ fn analyze_suggests_config() {
     assert!(output.contains("\"ignore_crossref_sections\""));
     assert!(output.contains("top concepts:"));
     assert!(output.contains("pages:"));
+}
+
+#[test]
+fn query_baseline_still_works_without_semantic_match() {
+    let index = MemoryIndex::from_records(vec![DocRecord {
+        doc_id: "d1".to_string(),
+        source: "d1.md".to_string(),
+        content: "docker install on linux".to_string(),
+        timestamp: None,
+        doc_length: 24,
+        author_agent: None,
+        probable_topic: Some("Install".to_string()),
+        doc_type_guess: None,
+        headings: vec!["Install".to_string()],
+        key_entities: vec![Tier1Entity {
+            text: "docker".to_string(),
+            label: "CONCEPT".to_string(),
+            start: 0,
+            end: 6,
+            score: Some(1.0),
+            source: "test".to_string(),
+        }],
+        important_terms: vec![RankedTerm {
+            term: "install".to_string(),
+            score: 2.0,
+            source: "test".to_string(),
+        }],
+        section_chunks: vec![],
+        embedding: None,
+        top_claims: vec![],
+        provenance: Provenance {
+            source: "d1.md".to_string(),
+            timestamp: None,
+            ner_provider: "heuristic".to_string(),
+            term_ranker: "test".to_string(),
+            index_version: "test".to_string(),
+        },
+    }]);
+
+    let results = index.query("docker", 10);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].doc_id, "d1");
+}
+
+#[test]
+fn semantic_expansion_improves_recall_for_synonyms() {
+    let index = MemoryIndex::from_records(vec![DocRecord {
+        doc_id: "d2".to_string(),
+        source: "d2.md".to_string(),
+        content: "setup openclaw runtime".to_string(),
+        timestamp: None,
+        doc_length: 27,
+        author_agent: None,
+        probable_topic: Some("Bootstrap".to_string()),
+        doc_type_guess: None,
+        headings: vec!["Bootstrap".to_string()],
+        key_entities: vec![],
+        important_terms: vec![RankedTerm {
+            term: "setup".to_string(),
+            score: 3.0,
+            source: "test".to_string(),
+        }],
+        section_chunks: vec![],
+        embedding: None,
+        top_claims: vec![],
+        provenance: Provenance {
+            source: "d2.md".to_string(),
+            timestamp: None,
+            ner_provider: "heuristic".to_string(),
+            term_ranker: "test".to_string(),
+            index_version: "test".to_string(),
+        },
+    }]);
+
+    // "install" expands to "bootstrap" in bundled lexical subsets.
+    let results = index.query("install", 10);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].doc_id, "d2");
 }
