@@ -1,6 +1,6 @@
 [package]
 name = "lint-ai"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Semantic wiki and docs linting for contradictions, stale claims, orphan pages, and missing cross-references"
 license = "Apache-2.0"
@@ -22,13 +22,18 @@ walkdir = "2"
 regex = "1"
 anyhow = "1"
 aho-corasick = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 comrak = { version = "0.20", default-features = false }
 Inflector = "0.11"
 unicode-normalization = "0.1"
 deunicode = "1"
+rust-stemmers = "1"
 petgraph = "0.5"
 tantivy = "0.22"
 bincode = "1.3"
+text2num = "2"
+thesaurus = "0.5"
+temps = { version = "3", features = ["chrono"] }
 
 [dev-dependencies]
 lru = "0.16.3"

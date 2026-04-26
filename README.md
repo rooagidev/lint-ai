@@ -226,7 +226,98 @@ The query pipeline uses hybrid scoring with:
 - topic/doc-type boosts when available
 - score breakdown output for transparency
 
+Lexical expansion data is kept as small checked-in JSON subsets under
+`data/lexical/`. The upstream ConceptNet assertions dump is large, roughly
+hundreds of MB compressed and about 1.2 GB extracted, so the full raw file is
+not committed to this repo. WordNet is much smaller, typically tens of MB
+depending on the package.
+
+Download locations:
+- ConceptNet assertions: `https://s3.amazonaws.com/conceptnet/downloads/2019/edges/conceptnet-assertions-5.7.0.csv.gz`
+- ConceptNet download docs: `https://github.com/commonsense/conceptnet5/wiki/Downloads`
+- Princeton WordNet downloads: `https://wordnet.princeton.edu/`
+
+To regenerate the checked-in subsets from local upstream downloads:
+
+```bash
+python3 scripts/build_lexical_subsets.py \
+  --wordnet-dict /path/to/WordNet-3.0/dict \
+  --conceptnet-assertions /path/to/conceptnet-assertions-5.7.0.csv.gz
+```
+
+Seed terms live in `data/lexical/seed_terms.txt`. Edit that file to widen or
+narrow the lexical coverage, then rerun the generator. The script accepts
+either the WordNet `dict/` directory itself or the parent WordNet package
+directory that contains `dict/`.
+
+The generated JSON writes back to:
+
+- `data/lexical/wordnet_subset.json`
+- `data/lexical/conceptnet_subset.json`
+
+More detail is in `docs/lexical-data.md`.
+
 Chunk strategy details: `docs/chunk-strategy.md`
+
+Artifact indexing and update model: `docs/artifact-indexing.md`
+Temporal fact / assertion layer: `docs/artifact-indexing.md` (see "Temporal Fact / Assertion Layer")
+
+## Library Use
+
+`lint-ai` can also be used as a library for artifact-oriented indexing.
+
+The current public model is:
+
+- `IndexStore`
+  - mutable artifact-facing facade
+  - owns source documents, cached derived records, tombstones, internal Tantivy lexical state, and refresh lifecycle
+- `MemoryIndex`
+  - built immutable query structure
+  - optimized for semantic and hybrid search signals
+
+Typical flow:
+
+1. Normalize external content into `SourceDocument`
+2. Insert or update it inside `IndexStore`
+3. Call `query(...)`, which refreshes the semantic `MemoryIndex` when needed and merges it with Tantivy BM25 hits
+
+Example:
+
+```rust
+use lint_ai::{IndexStore, PipelineOptions, SourceDocument};
+
+fn main() -> anyhow::Result<()> {
+    let mut index = IndexStore::in_memory(PipelineOptions::default());
+
+    index.upsert(SourceDocument {
+        doc_id: "artifact-1".to_string(),
+        source: "artifact://artifact-1".to_string(),
+        content: "docker install guide for linux hosts".to_string(),
+        concept: "docker install".to_string(),
+        headings: vec!["Overview".to_string()],
+        links: vec![],
+        timestamp: None,
+        doc_length: 36,
+        author_agent: None,
+    });
+
+    let results = index.query("docker install", 5)?;
+    println!("{}", serde_json::to_string_pretty(&results)?);
+    Ok(())
+}
+```
+
+For corpus-local persistence under `.lint-ai/`, use:
+
+```rust
+use std::path::Path;
+use lint_ai::{IndexStore, PipelineOptions};
+
+let index = IndexStore::for_corpus(Path::new("/path/to/corpus"), PipelineOptions::default())?;
+```
+
+If you already have fully prepared `DocRecord` values and want the built search
+structure directly, use `lint_ai::index::MemoryIndex`.
 
 ## Advanced
 
