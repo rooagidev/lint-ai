@@ -1,25 +1,5 @@
+use crate::pipeline::{ChunkStrategy, Tier1NerProvider, Tier1TermRankerKind};
 use clap::{Parser, ValueEnum};
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum Tier1NerProvider {
-    Heuristic,
-    Spacy,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum Tier1TermRankerKind {
-    Yake,
-    Rake,
-    Cvalue,
-    Textrank,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum ChunkStrategy {
-    Heading,
-    Line,
-    Hybrid,
-}
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum LlmChunkStrategy {

@@ -1,18 +1,19 @@
-use crate::cli::{
-    ChunkStrategy, GraphExportFormat, GraphLevel, LlmChunkStrategy, Tier1NerProvider,
-    Tier1TermRankerKind,
-};
+use crate::aggregation::build_aggregate_output;
+use crate::cli::{GraphExportFormat, GraphLevel, LlmChunkStrategy};
 use crate::config::{load_config, normalize_list, Config};
 use crate::filters::is_noise_concept;
 use crate::graph::{normalize_concept, Graph, Tier0Record};
-use crate::index::{DocRecord, MemoryIndex, Provenance, SectionChunk};
+use crate::index::{DocRecord, MemoryIndex, SectionChunk};
+use crate::pipeline::{
+    source_documents_to_tier1_inputs, ChunkStrategy, Tier1NerProvider, Tier1TermRankerKind,
+};
 use crate::report::Report;
 use crate::rules::cross_refs::check_cross_refs;
 use crate::rules::orphan_pages::check_orphans;
+use crate::source::SourceDocument;
 use crate::tier1::{
-    CValueStyleTermRanker, HeuristicKeyEntityRanker, ImportantTermRanker, KeyEntityRanker,
-    RakeStyleTermRanker, SpacyKeyEntityRanker, TextRankStyleTermRanker, Tier1DocEntities,
-    Tier1DocInput, Tier1DocTerms, YakeStyleTermRanker,
+    HeuristicKeyEntityRanker, ImportantTermRanker, KeyEntityRanker, SpacyKeyEntityRanker,
+    Tier1DocEntities, Tier1DocInput, Tier1DocTerms,
 };
 use aho_corasick::AhoCorasick;
 use anyhow::Result;
@@ -29,8 +30,44 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
-use regex::Regex;
 use walkdir::WalkDir;
+
+fn graph_to_source_documents(graph: &Graph) -> Vec<SourceDocument> {
+    let tier0_by_source: HashMap<String, &Tier0Record> = graph
+        .tier0_records
+        .iter()
+        .map(|r| (r.source.clone(), r))
+        .collect();
+    let concept_to_rel: HashMap<String, String> = graph
+        .pages
+        .iter()
+        .map(|p| (p.concept.clone(), p.rel_path.clone()))
+        .collect();
+
+    graph
+        .pages
+        .iter()
+        .map(|p| {
+            let t0 = tier0_by_source.get(&p.rel_path).copied();
+            SourceDocument {
+                doc_id: p.rel_path.clone(),
+                source: p.rel_path.clone(),
+                content: p.content.clone(),
+                concept: p.raw_concept.clone(),
+                group_id: None,
+                headings: p.headings.clone(),
+                links: p
+                    .links
+                    .iter()
+                    .filter_map(|c| concept_to_rel.get(c).cloned())
+                    .collect(),
+                timestamp: t0.and_then(|r| r.timestamp.clone()),
+                doc_length: t0.map(|r| r.doc_length).unwrap_or(p.content.len()),
+                author_agent: t0.and_then(|r| r.author_agent.clone()),
+            }
+        })
+        .collect()
+}
 
 fn surface_forms(raw: &str) -> Vec<String> {
     let raw = raw.trim();
@@ -481,17 +518,8 @@ fn show_tier1_entities(
     provider: &Tier1NerProvider,
     spacy_model: &str,
 ) -> Result<()> {
-    let docs: Vec<Tier1DocInput> = graph
-        .pages
-        .iter()
-        .map(|p| Tier1DocInput {
-            id: p.rel_path.clone(),
-            source: p.rel_path.clone(),
-            content: p.content.clone(),
-            concept: p.raw_concept.clone(),
-            headings: p.headings.clone(),
-        })
-        .collect();
+    let source_docs = graph_to_source_documents(graph);
+    let docs: Vec<Tier1DocInput> = source_documents_to_tier1_inputs(&source_docs);
     let heuristic = HeuristicKeyEntityRanker;
     let mut heuristic_by_doc = heuristic.rank_docs(&docs)?;
     let mut by_doc = match provider {
@@ -532,23 +560,14 @@ fn show_tier1_entities(
 }
 
 fn show_tier1_terms(graph: &Graph, ranker_kind: &Tier1TermRankerKind) -> Result<()> {
-    let docs: Vec<Tier1DocInput> = graph
-        .pages
-        .iter()
-        .map(|p| Tier1DocInput {
-            id: p.rel_path.clone(),
-            source: p.rel_path.clone(),
-            content: p.content.clone(),
-            concept: p.raw_concept.clone(),
-            headings: p.headings.clone(),
-        })
-        .collect();
+    let source_docs = graph_to_source_documents(graph);
+    let docs: Vec<Tier1DocInput> = source_documents_to_tier1_inputs(&source_docs);
 
     let ranker: Box<dyn ImportantTermRanker> = match ranker_kind {
-        Tier1TermRankerKind::Yake => Box::new(YakeStyleTermRanker),
-        Tier1TermRankerKind::Rake => Box::new(RakeStyleTermRanker),
-        Tier1TermRankerKind::Cvalue => Box::new(CValueStyleTermRanker),
-        Tier1TermRankerKind::Textrank => Box::new(TextRankStyleTermRanker),
+        Tier1TermRankerKind::Yake => Box::new(crate::tier1::YakeStyleTermRanker),
+        Tier1TermRankerKind::Rake => Box::new(crate::tier1::RakeStyleTermRanker),
+        Tier1TermRankerKind::Cvalue => Box::new(crate::tier1::CValueStyleTermRanker),
+        Tier1TermRankerKind::Textrank => Box::new(crate::tier1::TextRankStyleTermRanker),
     };
 
     let mut out = Vec::new();
@@ -564,254 +583,6 @@ fn show_tier1_terms(graph: &Graph, ranker_kind: &Tier1TermRankerKind) -> Result<
     Ok(())
 }
 
-fn select_term_ranker(ranker_kind: &Tier1TermRankerKind) -> Box<dyn ImportantTermRanker> {
-    match ranker_kind {
-        Tier1TermRankerKind::Yake => Box::new(YakeStyleTermRanker),
-        Tier1TermRankerKind::Rake => Box::new(RakeStyleTermRanker),
-        Tier1TermRankerKind::Cvalue => Box::new(CValueStyleTermRanker),
-        Tier1TermRankerKind::Textrank => Box::new(TextRankStyleTermRanker),
-    }
-}
-
-fn chunk_document_sections(content: &str, doc_id: &str) -> Vec<SectionChunk> {
-    let heading_re = Regex::new(r"(?m)^#{1,6}\s+(.*)$").expect("valid heading regex");
-    let mut chunks = Vec::new();
-    let mut last_start = 0usize;
-    let mut current_heading = "(document)".to_string();
-    let mut idx = 0usize;
-
-    for cap in heading_re.captures_iter(content) {
-        let m = match cap.get(0) {
-            Some(v) => v,
-            None => continue,
-        };
-        if m.start() > last_start {
-            let body = content[last_start..m.start()].trim();
-            if !body.is_empty() {
-                let start_line = content[..last_start].lines().count().max(1);
-                let end_line = content[..m.start()].lines().count().max(start_line);
-                chunks.push(SectionChunk {
-                    chunk_id: format!("{}::{}", doc_id, idx),
-                    heading: current_heading.clone(),
-                    content: body.to_string(),
-                    start_line,
-                    end_line,
-                    key_entities: Vec::new(),
-                    important_terms: Vec::new(),
-                });
-                idx += 1;
-            }
-        }
-        current_heading = cap
-            .get(1)
-            .map(|v| v.as_str().trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "(section)".to_string());
-        last_start = m.end();
-    }
-
-    let tail = content[last_start..].trim();
-    if !tail.is_empty() {
-        let start_line = content[..last_start].lines().count().max(1);
-        let end_line = content.lines().count().max(start_line);
-        chunks.push(SectionChunk {
-            chunk_id: format!("{}::{}", doc_id, idx),
-            heading: current_heading,
-            content: tail.to_string(),
-            start_line,
-            end_line,
-            key_entities: Vec::new(),
-            important_terms: Vec::new(),
-        });
-    }
-
-    if chunks.is_empty() {
-        chunks.push(SectionChunk {
-            chunk_id: format!("{}::0", doc_id),
-            heading: "(document)".to_string(),
-            content: content.to_string(),
-            start_line: 1,
-            end_line: content.lines().count().max(1),
-            key_entities: Vec::new(),
-            important_terms: Vec::new(),
-        });
-    }
-    chunks
-}
-
-fn chunk_document_lines(
-    content: &str,
-    doc_id: &str,
-    lines_per_chunk: usize,
-    overlap: usize,
-) -> Vec<SectionChunk> {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return vec![SectionChunk {
-            chunk_id: format!("{}::0", doc_id),
-            heading: "(document)".to_string(),
-            content: content.to_string(),
-            start_line: 1,
-            end_line: 1,
-            key_entities: Vec::new(),
-            important_terms: Vec::new(),
-        }];
-    }
-    let size = lines_per_chunk.clamp(1, 500);
-    let ov = overlap.min(size.saturating_sub(1));
-    let step = (size - ov).max(1);
-
-    let mut chunks = Vec::new();
-    let mut idx = 0usize;
-    let mut start = 0usize;
-    while start < lines.len() {
-        let end = (start + size).min(lines.len());
-        let body = lines[start..end].join("\n").trim().to_string();
-        if !body.is_empty() {
-            chunks.push(SectionChunk {
-                chunk_id: format!("{}::{}", doc_id, idx),
-                heading: format!("lines {}-{}", start + 1, end),
-                content: body,
-                start_line: start + 1,
-                end_line: end,
-                key_entities: Vec::new(),
-                important_terms: Vec::new(),
-            });
-            idx += 1;
-        }
-        if end == lines.len() {
-            break;
-        }
-        start += step;
-    }
-    if chunks.is_empty() {
-        chunks.push(SectionChunk {
-            chunk_id: format!("{}::0", doc_id),
-            heading: "(document)".to_string(),
-            content: content.to_string(),
-            start_line: 1,
-            end_line: lines.len().max(1),
-            key_entities: Vec::new(),
-            important_terms: Vec::new(),
-        });
-    }
-    chunks
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    let words = text.split_whitespace().count();
-    ((words as f32) * 1.3).ceil() as usize
-}
-
-fn chunk_document_hybrid(
-    content: &str,
-    doc_id: &str,
-    lines_per_chunk: usize,
-    overlap: usize,
-    target_tokens: usize,
-    max_tokens: usize,
-) -> Vec<SectionChunk> {
-    let base = chunk_document_lines(content, doc_id, lines_per_chunk, overlap);
-    let mut out = Vec::new();
-    let mut idx = 0usize;
-    let safe_target = target_tokens.clamp(100, max_tokens.max(100));
-    let safe_max = max_tokens.max(safe_target);
-
-    for chunk in base {
-        if estimate_tokens(&chunk.content) <= safe_max {
-            out.push(SectionChunk {
-                chunk_id: format!("{}::{}", doc_id, idx),
-                heading: chunk.heading,
-                content: chunk.content,
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                key_entities: Vec::new(),
-                important_terms: Vec::new(),
-            });
-            idx += 1;
-            continue;
-        }
-
-        let lines: Vec<&str> = chunk.content.lines().collect();
-        let mut start = 0usize;
-        while start < lines.len() {
-            let mut end = start + 1;
-            let mut best_end = end;
-            while end <= lines.len() {
-                let candidate = lines[start..end].join("\n");
-                let toks = estimate_tokens(&candidate);
-                if toks <= safe_target {
-                    best_end = end;
-                    end += 1;
-                    continue;
-                }
-                if toks <= safe_max && best_end == start + 1 {
-                    best_end = end;
-                }
-                break;
-            }
-            if best_end <= start {
-                best_end = (start + 1).min(lines.len());
-            }
-            let body = lines[start..best_end].join("\n").trim().to_string();
-            if !body.is_empty() {
-                out.push(SectionChunk {
-                    chunk_id: format!("{}::{}", doc_id, idx),
-                    heading: format!("{} (part {})", chunk.heading, idx),
-                    content: body,
-                    start_line: chunk.start_line.saturating_add(start),
-                    end_line: chunk.start_line.saturating_add(best_end).saturating_sub(1),
-                    key_entities: Vec::new(),
-                    important_terms: Vec::new(),
-                });
-                idx += 1;
-            }
-            if best_end == lines.len() {
-                break;
-            }
-            start = best_end;
-        }
-    }
-
-    if out.is_empty() {
-        return chunk_document_lines(content, doc_id, lines_per_chunk, overlap);
-    }
-    out
-}
-
-fn enrich_section_chunks(
-    mut chunks: Vec<SectionChunk>,
-    key_entities: &[crate::tier1::Tier1Entity],
-    important_terms: &[crate::tier1::RankedTerm],
-) -> Vec<SectionChunk> {
-    for chunk in &mut chunks {
-        let chunk_l = chunk.content.to_lowercase();
-        for ent in key_entities {
-            let term = ent.text.trim();
-            if term.len() < 2 {
-                continue;
-            }
-            if chunk_l.contains(&term.to_lowercase()) {
-                chunk.key_entities.push(term.to_string());
-            }
-        }
-        for term in important_terms {
-            let t = term.term.trim();
-            if t.len() < 2 {
-                continue;
-            }
-            if chunk_l.contains(&t.to_lowercase()) {
-                chunk.important_terms.push(t.to_string());
-            }
-        }
-        chunk.key_entities.sort();
-        chunk.key_entities.dedup();
-        chunk.important_terms.sort();
-        chunk.important_terms.dedup();
-    }
-    chunks
-}
-
 fn build_memory_index(
     graph: &Graph,
     provider: &Tier1NerProvider,
@@ -824,138 +595,24 @@ fn build_memory_index(
     chunk_max_tokens: usize,
     lexical_dir: Option<&Path>,
 ) -> Result<MemoryIndex> {
-    let docs: Vec<Tier1DocInput> = graph
-        .pages
-        .iter()
-        .map(|p| Tier1DocInput {
-            id: p.rel_path.clone(),
-            source: p.rel_path.clone(),
-            content: p.content.clone(),
-            concept: p.raw_concept.clone(),
-            headings: p.headings.clone(),
-        })
-        .collect();
-
-    let heuristic = HeuristicKeyEntityRanker;
-    let entities_by_doc = match provider {
-        Tier1NerProvider::Heuristic => heuristic.rank_docs(&docs)?,
-        Tier1NerProvider::Spacy => {
-            let spacy = SpacyKeyEntityRanker {
-                model: spacy_model.to_string(),
-                script_path: "scripts/spacy_ner.py".to_string(),
-            };
-            match spacy.rank_docs(&docs) {
-                Ok(out) => out,
-                Err(err) => {
-                    eprintln!(
-                        "warning: {} ranker unavailable ({}), falling back to heuristic",
-                        spacy.name(),
-                        err
-                    );
-                    heuristic.rank_docs(&docs).unwrap_or_default()
-                }
-            }
-        }
+    let source_docs = graph_to_source_documents(graph);
+    let options = crate::pipeline::PipelineOptions {
+        ner_provider: provider.clone(),
+        spacy_model: spacy_model.to_string(),
+        term_ranker: ranker_kind.clone(),
+        chunk_strategy: chunk_strategy.clone(),
+        chunk_lines,
+        chunk_overlap,
+        chunk_target_tokens,
+        chunk_max_tokens,
+        text_rerank_ngram: false,
+        text_rerank_lcs: false,
+        claim_extraction: false,
+        index_location: lexical_dir
+            .map(|path| crate::pipeline::IndexLocation::Explicit(path.to_path_buf()))
+            .unwrap_or(crate::pipeline::IndexLocation::InMemory),
     };
-
-    let term_ranker = select_term_ranker(ranker_kind);
-    let term_ranker_name = term_ranker.name().to_string();
-    let ner_provider_name = match provider {
-        Tier1NerProvider::Heuristic => "heuristic".to_string(),
-        Tier1NerProvider::Spacy => format!("spacy:{}", spacy_model),
-    };
-    let tier0_by_source: HashMap<String, &Tier0Record> = graph
-        .tier0_records
-        .iter()
-        .map(|r| (r.source.clone(), r))
-        .collect();
-    let concept_to_rel: HashMap<String, String> = graph
-        .pages
-        .iter()
-        .map(|p| (p.concept.clone(), p.rel_path.clone()))
-        .collect();
-
-    let mut records = Vec::new();
-    for doc in docs {
-        let key_entities = entities_by_doc.get(&doc.id).cloned().unwrap_or_default();
-        let important_terms = term_ranker.rank_terms(&doc);
-        let t0 = tier0_by_source.get(&doc.source).copied();
-        let probable_topic = if let Some(first_heading) = doc.headings.first() {
-            Some(first_heading.clone())
-        } else {
-            important_terms.first().map(|t| t.term.clone())
-        };
-        let joined_headings = doc.headings.join(" ").to_lowercase();
-        let content_l = doc.content.to_lowercase();
-        let doc_type_guess = if joined_headings.contains("incident")
-            || content_l.contains("postmortem")
-        {
-            Some("incident".to_string())
-        } else if joined_headings.contains("runbook") || content_l.contains("playbook") {
-            Some("runbook".to_string())
-        } else if joined_headings.contains("changelog") || content_l.contains("release notes") {
-            Some("changelog".to_string())
-        } else if joined_headings.contains("reference") {
-            Some("reference".to_string())
-        } else if joined_headings.contains("tutorial") || joined_headings.contains("quick start") {
-            Some("tutorial".to_string())
-        } else if joined_headings.contains("decision") || content_l.contains("adr") {
-            Some("decision".to_string())
-        } else {
-            None
-        };
-        let base_chunks = match chunk_strategy {
-            ChunkStrategy::Heading => chunk_document_sections(&doc.content, &doc.id),
-            ChunkStrategy::Line => {
-                chunk_document_lines(&doc.content, &doc.id, chunk_lines, chunk_overlap)
-            }
-            ChunkStrategy::Hybrid => chunk_document_hybrid(
-                &doc.content,
-                &doc.id,
-                chunk_lines,
-                chunk_overlap,
-                chunk_target_tokens,
-                chunk_max_tokens,
-            ),
-        };
-        let section_chunks = enrich_section_chunks(base_chunks, &key_entities, &important_terms);
-        let doc_links = graph
-            .pages
-            .iter()
-            .find(|p| p.rel_path == doc.id)
-            .map(|p| {
-                p.links
-                    .iter()
-                    .filter_map(|c| concept_to_rel.get(c).cloned())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        records.push(DocRecord {
-            doc_id: doc.id.clone(),
-            source: doc.source.clone(),
-            content: doc.content.clone(),
-            timestamp: t0.and_then(|r| r.timestamp.clone()),
-            doc_length: t0.map(|r| r.doc_length).unwrap_or(doc.content.len()),
-            author_agent: t0.and_then(|r| r.author_agent.clone()),
-            probable_topic,
-            doc_type_guess,
-            headings: doc.headings.clone(),
-            doc_links,
-            key_entities,
-            important_terms,
-            section_chunks,
-            embedding: None,
-            top_claims: Vec::new(),
-            provenance: Provenance {
-                source: doc.source.clone(),
-                timestamp: t0.and_then(|r| r.timestamp.clone()),
-                ner_provider: ner_provider_name.clone(),
-                term_ranker: term_ranker_name.clone(),
-                index_version: "v1-memory-hybrid".to_string(),
-            },
-        });
-    }
-    Ok(MemoryIndex::from_records_with_lexical_dir(records, lexical_dir))
+    crate::pipeline::build_query_snapshot(&source_docs, &options)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -996,10 +653,16 @@ struct CacheSettings<'a> {
 fn query_cache_key(s: &CacheSettings<'_>) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.root_path.hash(&mut hasher);
-    format!("{:?}", s.ner_provider).to_lowercase().hash(&mut hasher);
-    format!("{:?}", s.term_ranker).to_lowercase().hash(&mut hasher);
+    format!("{:?}", s.ner_provider)
+        .to_lowercase()
+        .hash(&mut hasher);
+    format!("{:?}", s.term_ranker)
+        .to_lowercase()
+        .hash(&mut hasher);
     s.spacy_model.hash(&mut hasher);
-    format!("{:?}", s.chunk_strategy).to_lowercase().hash(&mut hasher);
+    format!("{:?}", s.chunk_strategy)
+        .to_lowercase()
+        .hash(&mut hasher);
     s.chunk_lines.hash(&mut hasher);
     s.chunk_overlap.hash(&mut hasher);
     s.chunk_target_tokens.hash(&mut hasher);
@@ -1141,15 +804,27 @@ fn load_cached_query_index(s: &CacheSettings<'_>, corpus_fingerprint: &str) -> O
     }
     let lexical_dir = query_cache_lexical_dir(s);
     let core_file = query_cache_core_file(s);
-    match MemoryIndex::load_with_binary_core(cached.records.clone(), &core_file, Some(&lexical_dir)) {
+    match MemoryIndex::load_with_binary_core(
+        cached.records.clone(),
+        &core_file,
+        Some(&lexical_dir),
+        false,
+    )
+    {
         Ok(index) => return Some(index),
         Err(err) => {
-            eprintln!("warning: binary core cache load failed (falling back): {}", err);
+            eprintln!(
+                "warning: binary core cache load failed (falling back): {}",
+                err
+            );
         }
     }
     Some(MemoryIndex::from_records_with_lexical_dir(
         cached.records,
         Some(&lexical_dir),
+        false,
+        false,
+        false,
     ))
 }
 
@@ -1198,6 +873,7 @@ struct QueryOutput {
     elapsed_ms: u128,
     result_count: usize,
     results: Vec<crate::index::SearchResult>,
+    aggregation: Option<crate::aggregation::AggregateOutput>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1371,10 +1047,7 @@ fn build_llm_context_output(
             );
             chunk_scores.push((score, breakdown, chunk));
         }
-        chunk_scores.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        chunk_scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         for (score, breakdown, chunk) in chunk_scores {
             if score <= 0.0 {
@@ -1385,17 +1058,17 @@ fn build_llm_context_output(
                 result.doc_id.clone(),
                 combined_score,
                 LlmContextChunk {
-                doc_id: doc.doc_id.clone(),
-                source: doc.source.clone(),
-                chunk_id: chunk.chunk_id.clone(),
-                heading: chunk.heading.clone(),
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                matched_entities: result.matched_entities.clone(),
-                matched_terms: result.matched_terms.clone(),
-                score: combined_score,
-                score_breakdown: breakdown,
-                text: truncate_for_llm(&chunk.content, 1200),
+                    doc_id: doc.doc_id.clone(),
+                    source: doc.source.clone(),
+                    chunk_id: chunk.chunk_id.clone(),
+                    heading: chunk.heading.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    matched_entities: result.matched_entities.clone(),
+                    matched_terms: result.matched_terms.clone(),
+                    score: combined_score,
+                    score_breakdown: breakdown,
+                    text: truncate_for_llm(&chunk.content, 1200),
                 },
             ));
         }
@@ -1403,9 +1076,8 @@ fn build_llm_context_output(
 
     match strategy {
         LlmChunkStrategy::All => {
-            chunk_candidates_scored.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            chunk_candidates_scored
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             top_chunks.extend(
                 chunk_candidates_scored
                     .into_iter()
@@ -1418,9 +1090,15 @@ fn build_llm_context_output(
             let mut leftovers: Vec<(String, f32, LlmContextChunk)> = Vec::new();
             for (doc_id, combined, chunk) in chunk_candidates_scored {
                 match best_by_doc.get(&doc_id) {
-                    Some((best, _)) if *best >= combined => leftovers.push((doc_id, combined, chunk)),
+                    Some((best, _)) if *best >= combined => {
+                        leftovers.push((doc_id, combined, chunk))
+                    }
                     Some((_, prev)) => {
-                        leftovers.push((doc_id.clone(), *best_by_doc.get(&doc_id).map(|x| &x.0).unwrap_or(&combined), prev.clone()));
+                        leftovers.push((
+                            doc_id.clone(),
+                            *best_by_doc.get(&doc_id).map(|x| &x.0).unwrap_or(&combined),
+                            prev.clone(),
+                        ));
                         best_by_doc.insert(doc_id, (combined, chunk));
                     }
                     None => {
@@ -1535,7 +1213,9 @@ fn safe_write_text_file(out_path: &str, content: &str) -> Result<()> {
             use std::path::Component;
             match comp {
                 Component::RootDir | Component::CurDir => continue,
-                Component::ParentDir => anyhow::bail!("refusing to write: parent traversal is not allowed"),
+                Component::ParentDir => {
+                    anyhow::bail!("refusing to write: parent traversal is not allowed")
+                }
                 Component::Normal(seg) => {
                     cur.push(seg);
                     if let Ok(meta) = fs::symlink_metadata(&cur) {
@@ -1573,7 +1253,11 @@ fn export_graph_dot(graph: &Graph, out_path: &str) -> Result<String> {
 
     for page in &graph.pages {
         let node_id = format!("n_{}", dot_escape(&page.concept.replace(' ', "_")));
-        let label = format!("{}\\n({})", dot_escape(&page.rel_path), dot_escape(&page.concept));
+        let label = format!(
+            "{}\\n({})",
+            dot_escape(&page.rel_path),
+            dot_escape(&page.concept)
+        );
         lines.push(format!("  \"{}\" [label=\"{}\"];", node_id, label));
     }
 
@@ -1611,7 +1295,11 @@ fn export_chunk_graph_dot(graph: &Graph, out_path: &str) -> Result<String> {
     for edge in graph.chunk_graph.raw_edges() {
         let from = &graph.chunk_graph[edge.source()];
         let to = &graph.chunk_graph[edge.target()];
-        lines.push(format!("  \"{}\" -> \"{}\";", dot_escape(from), dot_escape(to)));
+        lines.push(format!(
+            "  \"{}\" -> \"{}\";",
+            dot_escape(from),
+            dot_escape(to)
+        ));
     }
     lines.push("}".to_string());
     safe_write_text_file(out_path, &lines.join("\n"))?;
@@ -2219,7 +1907,9 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             args.max_total_bytes,
         );
         let lexical_dir = query_cache_lexical_dir(&cache_settings);
-        let index = if let Some(cached) = load_cached_query_index(&cache_settings, &corpus_fingerprint) {
+        let index = if let Some(cached) =
+            load_cached_query_index(&cache_settings, &corpus_fingerprint)
+        {
             cached
         } else {
             let mut graph = Graph::build(
@@ -2251,15 +1941,13 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
                 args.chunk_max_tokens,
                 Some(&lexical_dir),
             )?;
-            if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built) {
+            if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built)
+            {
                 eprintln!("warning: unable to persist query cache: {}", err);
             }
             built
         };
-        let query_value = args
-            .llm_context
-            .as_deref()
-            .or(args.query.as_deref());
+        let query_value = args.llm_context.as_deref().or(args.query.as_deref());
         if let Some(query) = query_value {
             let started = Instant::now();
             if args.llm_context.is_some() {
@@ -2293,11 +1981,14 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             } else {
                 let results = index.query(query, DEFAULT_QUERY_TOP_K);
                 let elapsed_ms = started.elapsed().as_millis();
+                let aggregation =
+                    build_aggregate_output(&index, query, &results, DEFAULT_QUERY_TOP_K);
                 let payload = QueryOutput {
                     query: query.to_string(),
                     elapsed_ms,
                     result_count: results.len(),
                     results,
+                    aggregation,
                 };
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             }
@@ -2368,7 +2059,10 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             eprintln!("warning: unable to persist query cache: {}", err);
         }
         if args.index_redacted {
-            println!("{}", serde_json::to_string_pretty(&index.redacted_for_export())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&index.redacted_for_export())?
+            );
         } else {
             println!("{}", serde_json::to_string_pretty(&index)?);
         }
@@ -2416,7 +2110,10 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         return Ok(());
     }
     if args.show_chunk_graph_stats {
-        println!("{}", serde_json::to_string_pretty(&chunk_graph_stats(&graph))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&chunk_graph_stats(&graph))?
+        );
         return Ok(());
     }
     if let Some(format) = args.export_graph.as_ref() {

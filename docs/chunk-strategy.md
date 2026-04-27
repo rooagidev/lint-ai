@@ -84,7 +84,64 @@ Each chunk stores:
 - `chunk_id`
 - `heading`
 - `content`
+- `start_line`
+- `end_line`
 - `key_entities`
 - `important_terms`
 
-Chunk IDs are generated as `doc_id::index`.
+## Chunk ID Generation (Current)
+
+Chunk IDs are deterministic, content-derived, and stable across rebuilds when a
+chunk's semantic identity is unchanged.
+
+Current generation logic is implemented via:
+
+- `stable_chunk_id(doc_id, heading, content, start_line, end_line)`
+- `src/ids.rs`
+
+Behavior:
+
+1. Normalize heading/content components:
+   - lowercase
+   - trim
+   - collapse whitespace
+2. Build hash input parts:
+   - `doc_id`
+   - normalized `heading`
+   - normalized `content`
+   - `start_line`
+   - `end_line`
+3. Compute FNV-1a 64-bit hash
+4. Emit `chunk:<hex>`
+
+Pseudo-shape:
+
+```text
+chunk_id = "chunk:" + fnv1a64_hex(
+  doc_id,
+  normalize(heading),
+  normalize(content),
+  start_line,
+  end_line
+)
+```
+
+Implications:
+
+- Same document content + same chunk span/heading -> same `chunk_id`
+- If chunk content changes materially, `chunk_id` changes
+- IDs are independent of transient chunk ordering (`doc_id::index` is no longer used)
+
+## Chunk Lifecycle Interaction
+
+Chunk identity and chunk lifecycle are intentionally separate:
+
+- `SectionChunk` stores raw content/span/indexing features
+- lifecycle metadata tracks:
+  - `version`
+  - `is_latest`
+  - `supersedes_chunk_id`
+  - lineage key and timestamps
+
+Snapshot queries use the current `DocRecord.section_chunks` set (latest chunks),
+while lifecycle metadata preserves evolution history.

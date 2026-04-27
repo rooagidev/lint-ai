@@ -133,9 +133,11 @@ fn query_baseline_still_works_without_semantic_match() {
         timestamp: None,
         doc_length: 24,
         author_agent: None,
+        group_id: None,
         probable_topic: Some("Install".to_string()),
         doc_type_guess: None,
         headings: vec!["Install".to_string()],
+        doc_links: vec![],
         key_entities: vec![Tier1Entity {
             text: "docker".to_string(),
             label: "CONCEPT".to_string(),
@@ -171,16 +173,18 @@ fn semantic_expansion_improves_recall_for_synonyms() {
     let index = MemoryIndex::from_records(vec![DocRecord {
         doc_id: "d2".to_string(),
         source: "d2.md".to_string(),
-        content: "setup openclaw runtime".to_string(),
+        content: "job role and occupation details".to_string(),
         timestamp: None,
-        doc_length: 27,
+        doc_length: 31,
         author_agent: None,
-        probable_topic: Some("Bootstrap".to_string()),
+        group_id: None,
+        probable_topic: Some("Occupation".to_string()),
         doc_type_guess: None,
-        headings: vec!["Bootstrap".to_string()],
+        headings: vec!["Occupation".to_string()],
+        doc_links: vec![],
         key_entities: vec![],
         important_terms: vec![RankedTerm {
-            term: "setup".to_string(),
+            term: "job".to_string(),
             score: 3.0,
             source: "test".to_string(),
         }],
@@ -196,8 +200,8 @@ fn semantic_expansion_improves_recall_for_synonyms() {
         },
     }]);
 
-    // "install" expands to "bootstrap" in bundled lexical subsets.
-    let results = index.query("install", 10);
+    // "occupation" expands to "job" in bundled lexical subsets.
+    let results = index.query("occupation", 10);
     assert!(!results.is_empty());
     assert_eq!(results[0].doc_id, "d2");
 }
